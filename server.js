@@ -2,6 +2,7 @@ require('dotenv').config();
 const express = require('express');
 const ftp = require('ftp');
 const path = require('path');
+const Client = require('ssh2-sftp-client');
 const app = express();
 const port = process.env.PORT || 3000;
 
@@ -9,7 +10,8 @@ const port = process.env.PORT || 3000;
 app.use(express.urlencoded({ extended: true }));
 
 // Servir les fichiers statiques
-app.use('/Assets', express.static(path.join(__dirname, 'Assets')));
+app.use('/images', express.static(path.join(__dirname, 'images')));
+app.use(express.static(path.join(__dirname)));
 
 // Configuration FTP classique
 const ftpConfigSource = {
@@ -36,6 +38,14 @@ const ftpConfigSecond = {
   secure: false
 };
 
+// Configuration du serveur SFTP
+const sftpConfig = {
+  host: 'sftp.contributor.adobestock.com',
+  port: '22',
+  username: '206812899',
+  password: 'o73-*2T{'
+};
+
 // Route pour la page d'accueil
 app.get('/', (req, res) => {
   res.sendFile(path.join(__dirname, 'index.html'));
@@ -48,6 +58,13 @@ function connectToFtp(config) {
     client.on('error', err => reject(err));
     client.connect(config);
   });
+}
+
+function connectToSftp(config) {
+  const sftp = new Client();
+  return sftp.connect(config)
+    .then(() => sftp)
+    .catch(err => Promise.reject(err));
 }
 
 // Route pour explorer le contenu du serveur source
@@ -64,7 +81,8 @@ app.get('/ftp-source/:chemin?', async (req, res) => {
           .filter(fichier => (fichier.type === 'd' || fichier.name.endsWith('.mp4') || fichier.name.endsWith('.jpg')) && fichier.name !== '.' && fichier.name !== '..')
           .map(fichier => ({
             name: fichier.name,
-            type: fichier.type === 'd' ? 'dossier' : 'fichier'
+            type: fichier.type === 'd' ? 'dossier' : 'fichier',
+            size: fichier.size || null // Inclure la taille du fichier, null si dossier
           }));
         res.json(fichiers);
       }
@@ -87,6 +105,8 @@ app.post('/transfert', async (req, res) => {
     ftpConfigDestination = ftpConfig;
   } else if (destination === 'pond5') {
     ftpConfigDestination = ftpConfigSecond;
+  } else if (destination === 'adobestock') {
+    ftpConfigDestination = sftpConfig;
   } else {
     res.status(400).send('Destination inconnue.');
     return;
@@ -94,7 +114,7 @@ app.post('/transfert', async (req, res) => {
 
   try {
     const clientSource = await connectToFtp(ftpConfigSource);
-    const clientDestination = await connectToFtp(ftpConfigDestination);
+    const clientDestination = destination === 'adobestock' ? await connectToSftp(ftpConfigDestination) : await connectToFtp(ftpConfigDestination);
 
     clientSource.get(fichierSource, (err, stream) => {
       if (err) {
@@ -107,18 +127,31 @@ app.post('/transfert', async (req, res) => {
           buffers.push(data);
         });
 
-        stream.on('end', () => {
+        stream.on('end', async () => {
           const buffer = Buffer.concat(buffers);
-          clientDestination.put(buffer, path.basename(fichierSource), err => {
-            if (err) {
-              console.error('Erreur lors du transfert du fichier:', err);
-              res.status(500).send('Erreur lors du transfert du fichier.');
-            } else {
+          if (destination === 'adobestock') {
+            try {
+              await clientDestination.put(buffer, path.basename(fichierSource));
               res.json({ message: 'Fichier transféré avec succès!', fichier: path.basename(fichierSource) });
+            } catch (err) {
+              console.error('Erreur lors du transfert du fichier vers SFTP:', err);
+              res.status(500).send('Erreur lors du transfert du fichier vers SFTP.');
+            } finally {
+              clientSource.end();
+              clientDestination.end();
             }
-            clientSource.end();
-            clientDestination.end();
-          });
+          } else {
+            clientDestination.put(buffer, path.basename(fichierSource), err => {
+              if (err) {
+                console.error('Erreur lors du transfert du fichier:', err);
+                res.status(500).send('Erreur lors du transfert du fichier.');
+              } else {
+                res.json({ message: 'Fichier transféré avec succès!', fichier: path.basename(fichierSource) });
+              }
+              clientSource.end();
+              clientDestination.end();
+            });
+          }
         });
       }
     });
